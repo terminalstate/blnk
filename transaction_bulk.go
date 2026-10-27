@@ -18,11 +18,14 @@ package blnk
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/big"
+	"strings"
 	"time"
 
 	"github.com/blnkfinance/blnk/internal/apierror"
+	redlock "github.com/blnkfinance/blnk/internal/lock"
 	"github.com/blnkfinance/blnk/model"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel/attribute"
@@ -175,6 +178,150 @@ func (l *Blnk) handleAsyncBulkTransactionFailure(ctx context.Context, err error,
 
 	// Send webhook with the complete error message including rollback status
 	l.sendBulkTransactionWebhook(batchID, "failed", errorMessage, 0) // 0 count for failed batch
+}
+
+// ErrAtomicBatchFailed is the rejection reason of a queued item whose atomic
+// batch had already failed when the worker reached it.
+var ErrAtomicBatchFailed = errors.New("another transaction in this atomic batch was rejected")
+
+// atomicBatchFailedTTL is how long a failed queued atomic batch stays marked.
+// It has to outlast the batch's items still waiting in the queue, retries
+// included.
+const atomicBatchFailedTTL = 7 * 24 * time.Hour
+
+func atomicBatchLockKey(batchID string) string   { return "atomic-batch:" + batchID }
+func atomicBatchFailedKey(batchID string) string { return "atomic-batch-failed:" + batchID }
+
+// queuedAtomicBatchID returns the batch id of txn when it is a queued item of
+// an atomic bulk request. A refund of such an item copies its flags, but when
+// queued it gets its own QUEUED_PARENT_TRANSACTION, so it is not taken for a
+// batch item.
+func queuedAtomicBatchID(txn *model.Transaction) (string, bool) {
+	if !txn.Atomic || txn.MetaData == nil {
+		return "", false
+	}
+	batchID, _ := txn.MetaData["QUEUED_PARENT_TRANSACTION"].(string)
+	if !strings.HasPrefix(batchID, "bulk_") {
+		return "", false
+	}
+	return batchID, true
+}
+
+// WithQueuedAtomicBatch runs process for a queued item of an atomic bulk
+// request while holding the batch lock, and tells it whether the batch has
+// already failed. The items of one batch are thus applied one at a time: when
+// one is rejected, the rollback sees every item applied before it, and no item
+// is applied after it. Any other transaction runs process directly.
+func (l *Blnk) WithQueuedAtomicBatch(ctx context.Context, txn *model.Transaction, process func(batchFailed bool) error) error {
+	batchID, ok := queuedAtomicBatchID(txn)
+	if !ok {
+		return process(false)
+	}
+
+	locker := redlock.NewLocker(l.redis, atomicBatchLockKey(batchID), model.GenerateUUIDWithSuffix("loc"))
+	lockCfg := l.Config().Transaction
+	var err error
+	if lockCfg.LockWaitTimeout > 0 {
+		err = locker.WaitLock(ctx, lockCfg.LockDuration, lockCfg.LockWaitTimeout)
+	} else {
+		err = locker.Lock(ctx, lockCfg.LockDuration)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to acquire lock for atomic batch %s: %w", batchID, err)
+	}
+	defer l.releaseSingleLock(ctx, locker)
+
+	failed, err := l.redis.Exists(ctx, atomicBatchFailedKey(batchID)).Result()
+	if err != nil {
+		return fmt.Errorf("failed to check atomic batch %s: %w", batchID, err)
+	}
+	return process(failed > 0)
+}
+
+// failQueuedAtomicBatch rolls back a queued atomic batch after the worker
+// rejected one of its items, and reports it with bulk_transaction.failed.
+// Only the first rejected item does this; the mark it sets makes the worker
+// reject the batch's remaining items instead of applying them.
+func (l *Blnk) failQueuedAtomicBatch(ctx context.Context, err error, batchID string, isInflight bool) {
+	first, markErr := l.redis.SetNX(ctx, atomicBatchFailedKey(batchID), time.Now().UTC().Format(time.RFC3339), atomicBatchFailedTTL).Result()
+	if markErr != nil {
+		logrus.WithError(markErr).WithField("batch_id", batchID).Error("failed to mark atomic batch as failed")
+	} else if !first {
+		return
+	}
+	logrus.WithError(err).WithField("batch_id", batchID).Error("queued atomic bulk transaction rejected")
+
+	action, kind, nothing := "refunded", "applied", "Nothing from this batch had been applied, so nothing was refunded"
+	if isInflight {
+		action, kind, nothing = "voided", "inflight", "Nothing from this batch was inflight yet, so nothing was voided"
+	}
+	count, rollbackErr := l.rollBackQueuedAtomicBatch(ctx, batchID, isInflight)
+	l.logRollbackResult(batchID, action, rollbackErr)
+
+	var errorMessage string
+	switch {
+	case rollbackErr != nil:
+		errorMessage = fmt.Sprintf("%s. Failed to roll back all transactions: %s", err.Error(), rollbackErr.Error())
+	case count == 0:
+		errorMessage = fmt.Sprintf("%s. %s; the remaining transactions will not be processed.", err.Error(), nothing)
+	default:
+		errorMessage = fmt.Sprintf("%s. %d %s transaction(s) from this batch have been %s; the remaining transactions will not be processed.", err.Error(), count, kind, action)
+	}
+	l.sendBulkTransactionWebhook(batchID, "failed", errorMessage, 0)
+}
+
+// rollBackQueuedAtomicBatch reverses what a queued atomic batch has applied
+// and returns how many transactions it reversed. Refunds and voids are applied
+// here rather than queued, so the balances are back when it returns.
+func (l *Blnk) rollBackQueuedAtomicBatch(ctx context.Context, batchID string, isInflight bool) (int, error) {
+	if isInflight {
+		// Only what is already inflight. With nothing inflight the lookup falls
+		// back to the batch's QUEUED rows; those the worker will now reject.
+		inflightOnly := func(ctx context.Context, parentID string, batchSize int, offset int64) ([]*model.Transaction, error) {
+			txns, err := l.GetInflightTransactionsByParentID(ctx, parentID, batchSize, offset)
+			if err != nil || len(txns) == 0 || txns[0].Status != StatusInflight {
+				return nil, err
+			}
+			return txns, nil
+		}
+		voided, err := l.ProcessTransactionInBatches(ctx, batchID, big.NewInt(0), 1, false, inflightOnly, l.VoidWorker)
+		return len(voided), err
+	}
+
+	// Collect the applied items before refunding any, so the pages do not
+	// shift under the refunds being written.
+	batchSize := l.Config().Transaction.BatchSize
+	if batchSize <= 0 {
+		batchSize = 100
+	}
+	var applied []*model.Transaction
+	for offset := int64(0); ; offset += int64(batchSize) {
+		page, err := l.GetRefundableTransactionsByParentID(ctx, batchID, batchSize, offset)
+		if err != nil {
+			return 0, err
+		}
+		applied = append(applied, page...)
+		if len(page) < batchSize {
+			break
+		}
+	}
+
+	var refunded int
+	var errs []error
+	for _, txn := range applied {
+		// The refund points at the item it reverses, not at the batch, so a
+		// later refund of the batch does not take it for an applied item.
+		_, err := l.RefundTransactionWithOptions(ctx, txn.TransactionID, RefundOptions{
+			SkipQueue: true,
+			MetaData:  map[string]interface{}{"QUEUED_PARENT_TRANSACTION": txn.TransactionID},
+		})
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		refunded++
+	}
+	return refunded, errors.Join(errs...)
 }
 
 // CreateBulkTransactions handles the creation of multiple transactions in a batch.

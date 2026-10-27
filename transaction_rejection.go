@@ -76,7 +76,7 @@ func (l *Blnk) RejectTransaction(ctx context.Context, transaction *model.Transac
 		if !ok {
 			return nil, fmt.Errorf("parent transaction ID not found in meta data")
 		}
-		l.handleAsyncBulkTransactionFailure(ctx, errors.New("transaction rejected"), parentTransactionID, transaction.Atomic, transaction.Inflight)
+		l.failQueuedAtomicBatch(ctx, errors.New("transaction rejected"), parentTransactionID, transaction.Inflight)
 	}
 	// For rejected transactions, no balances were updated, so pass nil
 	l.postTransactionActions(ctx, transaction, nil, nil)

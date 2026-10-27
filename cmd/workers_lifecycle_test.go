@@ -18,9 +18,10 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -118,73 +119,155 @@ func TestProcessTransaction_DuplicateReferenceAcks(t *testing.T) {
 	assert.Equal(t, "5000", dstAfter.Balance.String(), "destination must not be credited twice")
 }
 
-// An atomic bulk request in the default queued mode: when the worker rejects
-// one item, the items it already applied must be rolled back.
-func TestProcessTransaction_AtomicBulkRejectionRollsBackQueuedItems(t *testing.T) {
+// An atomic bulk request in the default queued mode, run by the real worker,
+// which takes the items in whatever order asynq hands them out. When one item
+// is rejected, nothing from the batch may stay applied, and
+// bulk_transaction.failed must report the rollback it actually made.
+func TestWorker_AtomicBulkRejectionRollsBackQueuedBatch(t *testing.T) {
 	cfg := realInfraConfig(t)
-	cfg.Queue.TransactionQueue = "transaction_queue_cmd_test_bulk_" + strings.ToLower(gofakeit.LetterN(8))
+	suffix := strings.ToLower(gofakeit.LetterN(8))
+	cfg.Queue.TransactionQueue = "transaction_queue_cmd_test_bulk_" + suffix
+	cfg.Queue.WebhookQueue = "webhook_queue_cmd_test_bulk_" + suffix
 	cfg.Queue.InsufficientFundRetries = false
+	// Webhooks are only enqueued here; nothing serves this queue.
+	cfg.Notification.Webhook.Url = "http://127.0.0.1:1/bulk"
 	newBlnk, err := setupBlnk(cfg)
 	require.NoError(t, err, "Postgres and Redis must be running for the cmd test suite")
 	b := &blnkInstance{blnk: newBlnk, cnf: cfg}
 	ctx := context.Background()
 
+	srv, err := initializeWorkerServer(cfg, initializeQueues())
+	require.NoError(t, err)
+	mux := asynq.NewServeMux()
+	initializeTaskHandlers(b, mux)
+	require.NoError(t, srv.Start(mux))
+
 	queue := cfg.Queue.TransactionQueue + "_1"
 	inspector := asynq.NewInspector(asynq.RedisClientOpt{Addr: cfg.Redis.Dns})
+	db, err := sql.Open("postgres", cfg.DataSource.Dns)
+	require.NoError(t, err)
 	t.Cleanup(func() {
+		srv.Shutdown()
 		_ = inspector.DeleteQueue(queue, true)
+		_ = inspector.DeleteQueue(cfg.Queue.WebhookQueue, true)
 		_ = inspector.Close()
+		_ = db.Close()
 	})
-	// runQueued hands every pending task in the queue to the worker handler,
-	// bulk items in request order, until the queue stays empty.
-	runQueued := func() {
-		for idle := time.Now(); time.Since(idle) < time.Second; {
-			tasks, _ := inspector.ListPendingTasks(queue)
-			if len(tasks) == 0 {
-				time.Sleep(50 * time.Millisecond)
-				continue
+
+	// drain waits until the worker has nothing left to run, refunds included.
+	drain := func() {
+		deadline := time.Now().Add(30 * time.Second)
+		for idle := time.Now(); time.Since(idle) < time.Second; time.Sleep(50 * time.Millisecond) {
+			require.True(t, time.Now().Before(deadline), "the transaction queue did not drain")
+			info, err := inspector.GetQueueInfo(queue)
+			if err != nil || info.Pending+info.Active+info.Scheduled+info.Retry > 0 {
+				idle = time.Now()
 			}
-			sequence := func(i int) float64 {
-				var txn model.Transaction
-				_ = json.Unmarshal(tasks[i].Payload, &txn)
-				n, _ := txn.MetaData["sequence"].(float64)
-				return n
-			}
-			sort.SliceStable(tasks, func(i, j int) bool { return sequence(i) < sequence(j) })
-			for _, info := range tasks {
-				require.NoError(t, b.processTransaction(ctx, asynq.NewTask(info.Type, info.Payload)))
-				require.NoError(t, inspector.DeleteTask(queue, info.ID))
-			}
-			idle = time.Now()
 		}
 	}
+	failedWebhooks := func(batchID string) []string {
+		tasks, err := inspector.ListPendingTasks(cfg.Queue.WebhookQueue, asynq.PageSize(1000))
+		require.NoError(t, err)
+		var messages []string
+		for _, task := range tasks {
+			var hook struct {
+				Event string `json:"event"`
+				Data  struct {
+					BatchID string `json:"batch_id"`
+					Error   string `json:"error"`
+				} `json:"data"`
+			}
+			require.NoError(t, json.Unmarshal(task.Payload, &hook))
+			if hook.Event == "bulk_transaction.failed" && hook.Data.BatchID == batchID {
+				messages = append(messages, hook.Data.Error)
+			}
+		}
+		return messages
+	}
+	newBalance := func() *model.Balance {
+		balance, err := b.blnk.GetDataSource().CreateBalance(model.Balance{Currency: "USD", LedgerID: "general_ledger_id"})
+		require.NoError(t, err)
+		return &balance
+	}
+	balanceOf := func(id string) *model.Balance {
+		balance, err := b.blnk.GetDataSource().GetBalanceByIDLite(id)
+		require.NoError(t, err)
+		return balance
+	}
 
-	funding, src := createBalancePair(t, b)
-	dst1, dst2 := createBalancePair(t, b)
-	funded := queuedTransaction(funding.BalanceID, src.BalanceID, 100, true)
-	funded.SkipQueue = true
-	_, err = b.blnk.QueueTransaction(ctx, funded)
-	require.NoError(t, err)
+	// The source of each batch holds 100: 500 cannot be paid, 50 and 10 can.
+	// Every case is sent five times and all batches go to the worker at once,
+	// so the items are applied in varying orders.
+	type batch struct {
+		name     string
+		inflight bool
+		amounts  []float64
+		id       string
+		src      *model.Balance
+		dsts     []*model.Balance
+	}
+	var batches []*batch
+	for _, inflight := range []bool{false, true} {
+		for _, amounts := range [][]float64{{50, 500}, {50, 500, 10}} {
+			for run := 0; run < 5; run++ {
+				bt := &batch{name: fmt.Sprintf("inflight=%v %v run %d", inflight, amounts, run), inflight: inflight, amounts: amounts}
+				funding := newBalance()
+				bt.src = newBalance()
+				funded := queuedTransaction(funding.BalanceID, bt.src.BalanceID, 100, true)
+				funded.SkipQueue = true
+				_, err := b.blnk.QueueTransaction(ctx, funded)
+				require.NoError(t, err)
 
-	_, err = b.blnk.CreateBulkTransactions(ctx, &model.BulkTransactionRequest{
-		Atomic: true,
-		Transactions: []*model.Transaction{
-			{Reference: "ref_" + gofakeit.UUID(), Source: src.BalanceID, Destination: dst1.BalanceID, Amount: 50, Precision: 100, Currency: "USD"},
-			{Reference: "ref_" + gofakeit.UUID(), Source: src.BalanceID, Destination: dst2.BalanceID, Amount: 500, Precision: 100, Currency: "USD"},
-		},
-	})
-	require.NoError(t, err)
+				var items []*model.Transaction
+				for _, amount := range amounts {
+					dst := newBalance()
+					bt.dsts = append(bt.dsts, dst)
+					items = append(items, &model.Transaction{Reference: "ref_" + gofakeit.UUID(), Source: bt.src.BalanceID, Destination: dst.BalanceID, Amount: amount, Precision: 100, Currency: "USD"})
+				}
+				result, err := b.blnk.CreateBulkTransactions(ctx, &model.BulkTransactionRequest{Atomic: true, Inflight: inflight, Transactions: items})
+				require.NoError(t, err)
+				bt.id = result.BatchID
+				batches = append(batches, bt)
+			}
+		}
+	}
+	drain()
 
-	// Item 1 applies, item 2 is rejected for insufficient funds, and the
-	// rollback of item 1 goes through the queue as well.
-	runQueued()
+	for _, bt := range batches {
+		srcAfter := balanceOf(bt.src.BalanceID)
+		assert.Equal(t, "10000", srcAfter.Balance.String(), "%s: the source must be back at 100", bt.name)
+		assert.Equal(t, "0", srcAfter.InflightDebitBalance.String(), "%s: no inflight debit may stay", bt.name)
+		for i, dst := range bt.dsts {
+			dstAfter := balanceOf(dst.BalanceID)
+			assert.Equal(t, "0", dstAfter.Balance.String(), "%s: item %d must not stay applied", bt.name, i)
+			assert.Equal(t, "0", dstAfter.InflightCreditBalance.String(), "%s: item %d must not stay inflight", bt.name, i)
+		}
 
-	srcAfter, err := b.blnk.GetDataSource().GetBalanceByIDLite(src.BalanceID)
-	require.NoError(t, err)
-	dst1After, err := b.blnk.GetDataSource().GetBalanceByIDLite(dst1.BalanceID)
-	require.NoError(t, err)
-	assert.Equal(t, "10000", srcAfter.Balance.String(), "source must be back to 100")
-	assert.Equal(t, "0", dst1After.Balance.String(), "the applied item must be rolled back")
+		// Items the worker had applied (or put inflight) before the
+		// rejection; the webhook must report exactly these as rolled back.
+		status, kind, action := "APPLIED", "applied", "refunded"
+		if bt.inflight {
+			status, kind, action = "INFLIGHT", "inflight", "voided"
+		}
+		var held int
+		require.NoError(t, db.QueryRow(`SELECT count(*) FROM blnk.transactions
+			WHERE status = $2 AND meta_data->>'QUEUED_PARENT_TRANSACTION' = $1
+			AND reference NOT LIKE '%_refund'`, bt.id, status).Scan(&held))
+		messages := failedWebhooks(bt.id)
+		require.Len(t, messages, 1, "%s: one bulk_transaction.failed per batch", bt.name)
+		if held == 0 {
+			assert.Contains(t, messages[0], "Nothing from this batch", "%s", bt.name)
+		} else {
+			assert.Contains(t, messages[0], fmt.Sprintf("%d %s transaction(s) from this batch have been %s", held, kind, action), "%s", bt.name)
+		}
+
+		// Every other item ends REJECTED: the one that failed, and the
+		// ones the worker reached after it, which were never applied.
+		var rejected int
+		require.NoError(t, db.QueryRow(`SELECT count(*) FROM blnk.transactions
+			WHERE status = 'REJECTED' AND meta_data->>'QUEUED_PARENT_TRANSACTION' = $1`, bt.id).Scan(&rejected))
+		assert.Equal(t, len(bt.amounts)-held, rejected, "%s: the items not applied must be rejected", bt.name)
+	}
 }
 
 func TestProcessInflightCommitAndExpiry(t *testing.T) {
